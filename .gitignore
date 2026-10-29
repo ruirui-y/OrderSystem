@@ -1,0 +1,31 @@
+# CMake 构建目录和编译产物
+/build/
+/out/
+.cache/
+compile_commands.json
+
+# IDE 和本机工具生成的文件
+/.vs/
+/.workbuddy/
+/.idea/
+/.vscode/
+
+# 编译生成的文件
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.lib
+*.exe
+*.pdb
+*.log
+
+# 本地打包文件不提交到 Git
+*.zip
+*.tar
+*.tar.gz
+
+# 测试和性能测试产生的临时结果
+/test-results/
+/benchmark-results/

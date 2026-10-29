@@ -1,0 +1,96 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 22,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "linux-base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "linux-debug",
+            "displayName": "OrderSystem Linux Debug",
+            "description": "Linux + Ninja + C++20 Debug",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "linux-release",
+            "displayName": "OrderSystem Linux Release",
+            "description": "Linux + Ninja + C++20 Release",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "linux-asan",
+            "displayName": "OrderSystem Linux ASan",
+            "description": "Linux Debug + AddressSanitizer",
+            "inherits": "linux-debug",
+            "cacheVariables": {
+                "ORDERSYSTEM_ENABLE_ASAN": "ON"
+            }
+        },
+        {
+            "name": "linux-ubsan",
+            "displayName": "OrderSystem Linux UBSan",
+            "description": "Linux Debug + UndefinedBehaviorSanitizer",
+            "inherits": "linux-debug",
+            "cacheVariables": {
+                "ORDERSYSTEM_ENABLE_UBSAN": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "build-linux-debug",
+            "configurePreset": "linux-debug"
+        },
+        {
+            "name": "build-linux-release",
+            "configurePreset": "linux-release"
+        },
+        {
+            "name": "build-linux-asan",
+            "configurePreset": "linux-asan"
+        },
+        {
+            "name": "build-linux-ubsan",
+            "configurePreset": "linux-ubsan"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "test-linux-debug",
+            "configurePreset": "linux-debug",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "test-linux-asan",
+            "configurePreset": "linux-asan",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "test-linux-ubsan",
+            "configurePreset": "linux-ubsan",
+            "output": {
+                "outputOnFailure": true
+            }
+        }
+    ]
+}
