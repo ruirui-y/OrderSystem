@@ -29,3 +29,12 @@ compile_commands.json
 # 测试和性能测试产生的临时结果
 /test-results/
 /benchmark-results/
+
+# 本地数据库密码等配置，不要提交
+.env
+.env.*
+!.env.example
+
+/perf-results/
+*.bkp
+drawio/.$*
