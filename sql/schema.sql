@@ -1,0 +1,33 @@
+CREATE DATABASE IF NOT EXISTS ordersystem_bench
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
+
+USE ordersystem_bench;
+
+CREATE TABLE IF NOT EXISTS bench_read_records
+(
+    id BIGINT UNSIGNED NOT NULL,
+    value BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS bench_update_records
+(
+    id BIGINT UNSIGNED NOT NULL,
+    value BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS bench_delete_records
+(
+    id BIGINT UNSIGNED NOT NULL,
+    value BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS bench_insert_records
+(
+    id BIGINT UNSIGNED NOT NULL,
+    value BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (id)
+) ENGINE=InnoDB;
