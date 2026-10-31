@@ -1,18 +1,19 @@
 # OrderSystem
 
-OrderSystem 的第一阶段重点不是实现完整的电商功能，而是用一个最小的 RPC 服务把 MySQL 操作放进真实请求路径，测量固定并发下读写操作对吞吐和延迟的影响。
+OrderSystem is a small RPC benchmark that measures the cost of PostgreSQL operations on a real request path.
 
-## 当前实验
+## Current experiment
 
-- 复用现有 NebulaRPC 协程 RPC 框架。
-- 固定客户端为 4 个 Worker、每条连接 `window=512`，总在途 RPC 为 2048。
-- 比较按主键读取、插入、更新、删除四种 MySQL 操作。
-- 每种操作记录 QPS、平均延迟、P50、P95、P99 和 P99.9。
-- 使用固定大小的数据库工作线程池，避免阻塞式 MySQL 调用直接卡住 RPC EventLoop。
+- Reuse the existing NebulaRPC coroutine RPC framework.
+- Keep the current fixed client model: 4 workers and `window=512` per connection (2048 in-flight RPCs in total).
+- Compare primary-key reads, inserts, updates, and deletes in PostgreSQL.
+- Record QPS, average latency, P50, P95, P99, and P99.9.
+- Phase 1 uses `libpq` prepared statements and the existing fixed-size database worker pool. Blocking PostgreSQL calls do not run on the RPC EventLoop.
 
-详细步骤见 [`docs/database-operation-benchmark.md`](docs/database-operation-benchmark.md)。
+## Database migration status
 
+The project now uses PostgreSQL only. MySQL and MariaDB client headers, libraries, SQL syntax, and command-line tools have been removed.
 
-## 第一阶段：数据库读写性能实验
+This phase deliberately keeps the database worker pool so that the database migration can be tested independently from the later EventLoop and Pipeline Mode redesign.
 
-第一阶段先不实现完整订单业务，而是固定 NebulaRPC 的并发模型，单独比较 MySQL 主键读取、插入、更新和删除的吞吐与延迟。测试结果同时记录 RPC 完整耗时、数据库线程池排队时间和数据库调用耗时。具体运行方式见 `docs/database-operation-benchmark.md`。
+See `scripts/setup_ubuntu_env.sh`, `sql/schema.sql`, and `sql/seed.sql` for installation and database setup.

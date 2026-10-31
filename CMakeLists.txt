@@ -21,7 +21,7 @@ option(ORDERSYSTEM_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
 find_package(Protobuf REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(MARIADB REQUIRED IMPORTED_TARGET libmariadb)
+pkg_check_modules(LIBPQ REQUIRED IMPORTED_TARGET libpq)
 
 set(NEBULARPC_ROOT "$ENV{HOME}/.vs/NebulaRPC" CACHE PATH "Path to the existing NebulaRPC source repository")
 if(NOT EXISTS "${NEBULARPC_ROOT}/CMakeLists.txt")
@@ -49,15 +49,15 @@ target_link_libraries(order_db_benchmark_proto PUBLIC protobuf::libprotobuf)
 
 # 服务端把数据库操作交给固定数量的数据库线程，避免阻塞 RPC 的 EventLoop。
 add_executable(order_db_benchmark_server
-    src/order_db_benchmark_server.cpp
-    src/db_pool.cpp
+    benchmarks/order_db/order_db_benchmark_server.cpp
+    src/database/db_pool.cpp
 )
 target_include_directories(order_db_benchmark_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(order_db_benchmark_server PRIVATE nebula_rpc order_db_benchmark_proto PkgConfig::MARIADB Threads::Threads)
+target_link_libraries(order_db_benchmark_server PRIVATE nebula_rpc order_db_benchmark_proto PkgConfig::LIBPQ Threads::Threads)
 
 # 客户端沿用 NebulaRPC 的固定并发模型，window 表示每条连接同时保持的在途请求数。
 add_executable(order_db_benchmark_client
-    src/order_db_benchmark_client.cpp
+    benchmarks/order_db/order_db_benchmark_client.cpp
 )
 target_include_directories(order_db_benchmark_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(order_db_benchmark_client PRIVATE nebula_rpc order_db_benchmark_proto Threads::Threads)

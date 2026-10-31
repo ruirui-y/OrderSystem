@@ -1,13 +1,17 @@
-// NebulaRPC Fixed-InFlight 协程压测客户端。
+// NebulaRPC 固定在途请求数的协程压测客户端。
+//
+// 本程序用固定数量的请求持续压测服务端，而不是发完一条请求就等它返回再发下一条。
 //
 // 测试模型：
-//   workers = OS Thread = EventLoop = RpcChannel = TCP Connection
-//   window  = 每条 TCP 连接上同时维持的最大 in-flight RPC 数
-//   total_inflight = workers * window
+//   workers：客户端工作线程数量
+//   每个 worker：一个线程、一个 EventLoop、一个 RpcChannel、一条 TCP 连接
+//   window：这条 TCP 连接上最多同时等待响应的 RPC 数量，也就是单连接在途请求上限
+//   total_inflight：所有连接合计的在途请求上限，等于 workers * window
 //
-// 每个 Lane 是一条串行 RPC 链；同一 Worker 上的 window 个 Lane 共享一条 RpcChannel。
-// 初始阶段先让全部 Lane 运行到第一个 co_await，把 window 个请求写入 output_buffer，
-// 然后统一 Flush。后续响应到达时，RpcChannel 会先恢复本批协程，再统一 Flush 下一批请求。
+// 每个 Lane 是一条独立的请求链：它一次只等待自己发出的那一条 RPC。
+// 同一个 Worker 启动 window 个 Lane，它们共用同一条 TCP 连接，因此可以让这条连接上同时存在多条在途请求。
+// 第一批请求先写入 RpcChannel 的发送缓冲区，再统一 Flush（真正提交发送）；
+// 后续响应到达时，RpcChannel 会恢复完成的协程，并把新请求合并后再发送。
 
 #include "nebula/net/event_loop.h"
 #include "nebula/rpc/rpc_channel.h"
@@ -83,6 +87,8 @@ struct Options
     std::exit(error.empty() ? 0 : 2);
 }
 
+// 将命令行中的数字转换为无符号整数。
+// 这里拒绝负数，也拒绝数字后面带有其他字符的输入，避免配置被静默截断。
 std::uint64_t ParseUnsigned(const std::string& text)
 {
     if (text.empty() || text.front() == '-')
@@ -101,6 +107,8 @@ std::uint64_t ParseUnsigned(const std::string& text)
     return value;
 }
 
+// 读取并检查全部压测参数。
+// 参数范围在启动 Worker 之前统一检查，避免压测跑到一半才发现配置不合法。
 Options ParseOptions(int argc, char** argv)
 {
     Options o;
@@ -196,6 +204,8 @@ Options ParseOptions(int argc, char** argv)
     return o;
 }
 
+// 所有 Worker 共用的启动屏障。
+// 主线程等所有 Worker 都连接成功后才把 go 设为 true，让各个 Worker 尽量同时开始计时。
 struct SharedStart
 {
     std::atomic<std::size_t> ready{0};  // 已经连好 RPC 或已报告启动失败的 Worker 数量
@@ -203,6 +213,7 @@ struct SharedStart
     std::atomic<bool> cancel{false};    // 启动失败时通知其他 Worker 一起取消启动
 };
 
+// 单个 Worker 的压测统计。每个工作线程只写自己的 Stats，全部结束后主线程再汇总。
 struct Stats
 {
     std::size_t worker_id = 0;                    // 这份统计属于哪个 Worker，从 0 开始编号
@@ -226,6 +237,8 @@ struct Stats
     std::string db_error;                         // 数据库操作失败时服务端返回的错误信息
 };
 
+// 把命令行里的操作名称转换为 Protobuf 枚举。
+// ParseOptions 已经限制了可选值，因此这里最后一种情况就是 DELETE。
 DbBenchmarkRequest::Operation OperationFromName(const std::string& operation)
 {
     if (operation == "read")
@@ -243,9 +256,12 @@ DbBenchmarkRequest::Operation OperationFromName(const std::string& operation)
     return DbBenchmarkRequest::DELETE;
 }
 
+// 一个 Worker 对应一条 RPC 连接和一个 EventLoop。
+// 它内部启动多个 Lane，让同一条连接上保持固定数量的 RPC 请求在途。
 class Worker
 {
 public:
+    // 保存本 Worker 的任务份额，并创建它独占的 EventLoop 和 RPC 连接对象。
     Worker(const Options& opts,
            SharedStart& shared,
            std::size_t worker_id,
@@ -266,6 +282,7 @@ public:
         stats_.db_queue_wait_us.reserve(static_cast<std::size_t>(target_));
     }
 
+    // 启动连接准备协程，然后运行 EventLoop，直到所有 Lane 完成或测试提前失败。
     Stats Run()
     {
         setup_task_ = Setup();
@@ -279,6 +296,8 @@ public:
     }
 
 private:
+    // 向主线程报告一次“我已经准备好”或“我已经启动失败”。
+    // announced_ready_ 用来防止同一个 Worker 重复增加 ready 数量。
     void AnnounceReady()
     {
         if (announced_ready_)
@@ -290,6 +309,8 @@ private:
         shared_.ready.fetch_add(1, std::memory_order_release);
     }
 
+    // 记录当前 Worker 的失败原因，并停止它自己的 EventLoop。
+    // 如果 Worker 尚未报告准备完成，也要报告一次，避免主线程一直等待。
     void Abort(const std::string& reason)
     {
         if (stats_.error.empty())
@@ -307,6 +328,11 @@ private:
         loop_.Quit();
     }
 
+    // Worker 的启动流程分成三个阶段：
+    // 1. 等待 RPC 连接建立；
+    // 2. 报告 ready，并等待主线程统一发出 go 信号；
+    // 3. 开始正式计时，启动所有 Lane。
+    // 连接等待和统一起跑都通过协程定时唤醒，不会阻塞 EventLoop。
     nebula::coro::Task<int> Setup()
     {
         const TimePoint connect_deadline = Clock::now() +
@@ -329,7 +355,8 @@ private:
             co_await nebula::net::SleepFor(&loop_, std::chrono::milliseconds(10));
         }
 
-        AnnounceReady();                                          // 不发送预热请求，避免 INSERT/DELETE 提前改变测试表内容
+        // 不发送预热请求：INSERT/DELETE 的预热会改变测试表内容，影响正式测试的数据规模。
+        AnnounceReady();
 
         while (!shared_.go.load(std::memory_order_acquire))
         {
@@ -363,7 +390,10 @@ private:
         co_return 0;
     }
 
-    nebula::coro::Task<int> RunLane()                                // 每个 Lane 最多有 1 个 RPC 在途；window 个 Lane 共用一条连接
+    // 一个 Lane 是一条循环执行的 RPC 请求链。
+    // 它发出一条请求后会在 co_await 处挂起，收到响应后才继续发送下一条；
+    // 因此一个 Lane 同时最多只有一条请求在途，多个 Lane 合起来形成单连接的并发请求窗口。
+    nebula::coro::Task<int> RunLane()
     {
         while (stats_.error.empty())
         {
@@ -372,7 +402,8 @@ private:
                 break;
             }
 
-            const std::uint64_t sequence = next_request_++;          // 当前 Worker 内这是第几条请求，从 0 开始计数
+            // 当前请求在本 Worker 内的序号，从 0 开始；取出后立即递增，避免不同 Lane 重复分配。
+            const std::uint64_t sequence = next_request_++;
 
             DbBenchmarkRequest request;
             request.set_operation(OperationFromName(opts_.operation));
@@ -380,30 +411,37 @@ private:
 
             if (opts_.operation == "insert" || opts_.operation == "delete")
             {
-                request.set_key(base_sequence_ + sequence + 1);      // INSERT/DELETE 每次使用不同 key
+                // 写入和删除操作必须使用互不重复的 key，避免不同请求争用同一条测试记录。
+                request.set_key(base_sequence_ + sequence + 1);
             }
             else
             {
+                // READ/UPDATE 从预先生成的记录中分散选择 key，避免所有请求集中访问同一行。
                 const std::uint64_t global_sequence =
                     sequence * static_cast<std::uint64_t>(opts_.workers) +
-                    static_cast<std::uint64_t>(worker_id_);          // 把各 Worker 的请求合成一个全局序号
+                    static_cast<std::uint64_t>(worker_id_);
                 const std::uint64_t mixed_key =
-                    global_sequence * std::uint64_t{2654435761ULL};  // 根据请求序号算出预置表中的记录编号
-                request.set_key(mixed_key % kSeedRowCount + 1);      // READ/UPDATE 分散访问预置数据，避免集中争抢同一行
+                    global_sequence * std::uint64_t{2654435761ULL};
+                request.set_key(mixed_key % kSeedRowCount + 1);
             }
 
             nebula::rpc::RpcCallOptions options;
             options.timeout = std::chrono::milliseconds(opts_.timeout_ms);
-            options.flush = false;                                   // 先把请求放进发送缓冲区，等本轮 Lane 都启动后再统一 Flush
+            // 当前 Lane 只负责把请求写入 RpcChannel 的发送缓冲区，不立即触发 socket 写入。
+            // 第一批 Lane 全部启动后，StartLanes() 会统一 Flush，减少小批量发送。
+            options.flush = false;
 
-            const TimePoint sent_at = Clock::now();                  // 发出这条 RPC 前的时刻，用来计算往返耗时
+            // 记录提交 RPC 调用前的时刻。因为 flush=false，这个时刻可能早于真正写入 socket 的时刻；
+            // 统计值表示客户端从提交请求到收到响应的完整等待时间。
+            const TimePoint sent_at = Clock::now();
             ++stats_.issued;
             ++in_flight_;
 
             auto result = co_await stub_.Call<DbBenchmarkRequest, DbBenchmarkResponse>(
                 method_, std::move(request), options);
 
-            const TimePoint ended_at = Clock::now();                 // 收到这条 RPC 响应后的时刻
+            // 协程恢复说明这条 RPC 已经收到结果，记录结束时刻并释放一个在途名额。
+            const TimePoint ended_at = Clock::now();
 
             --in_flight_;
             ++stats_.completed;
@@ -449,12 +487,14 @@ private:
         co_return stats_.error.empty() ? 0 : 1;
     }
 
+    // 根据本 Worker 的请求数量和 window 决定启动多少个 Lane。
+    // 所有 Lane 先运行到各自的第一个挂起点，把第一批请求放入发送缓冲区，最后统一 Flush。
     void StartLanes()
     {
         const std::size_t lane_count = static_cast<std::size_t>(
             std::min<std::uint64_t>(
                 static_cast<std::uint64_t>(opts_.window),
-                target_));  // 实际启动的 Lane 数，不超过 window 和本 Worker 的剩余请求数
+                target_));  // 请求总数不足 window 时，只启动实际需要的 Lane
 
         if (lane_count == 0)
         {
@@ -476,9 +516,11 @@ private:
             task.Start();
         }
 
-        stub_.Flush();      // 所有 Lane 都已启动，现在一次性发送第一批请求
+        // 所有 Lane 都已经把第一条请求放进发送缓冲区，现在一次性提交第一批请求。
+        stub_.Flush();
     }
 
+    // 一个 Lane 结束后减少活动数量；最后一个 Lane 结束时记录 Worker 结束时刻并退出 EventLoop。
     void OnLaneFinished()
     {
         if (active_lanes_ == 0)
@@ -495,6 +537,8 @@ private:
         }
     }
 
+    // 收集协程中保存的异常。
+    // Task 的异常要在任务结束后通过 Result() 取出，否则某个 Lane 的异常可能被遗漏。
     void CollectTaskErrors()
     {
         if (setup_task_.Done())
@@ -539,30 +583,32 @@ private:
         }
     }
 
-    const Options& opts_;                                         // 本次压测的配置
-    SharedStart& shared_;                                         // 与其他 Worker 共用的启动信号
-    std::uint64_t target_ = 0;                                    // 分配给这个 Worker 的请求总数
-    std::size_t worker_id_ = 0;                                   // 当前 Worker 的编号，从 0 开始
-    std::uint64_t base_sequence_ = 0;                             // INSERT/DELETE 使用的起始编号，避免不同 Worker 生成相同 key
+    const Options& opts_;                                         // 本轮压测配置；由 main 创建并保证比 Worker 活得更久
+    SharedStart& shared_;                                         // 所有 Worker 共用的起跑信号和取消信号
+    std::uint64_t target_ = 0;                                    // 分配给当前 Worker 的请求总数
+    std::size_t worker_id_ = 0;                                   // 当前 Worker 编号，从 0 开始
+    std::uint64_t base_sequence_ = 0;                             // 当前 Worker 可使用的 key 起始位置，避免不同 Worker 的写操作撞 key
 
-    nebula::net::EventLoop loop_;                                 // 这个 Worker 的事件循环，负责驱动协程和 RPC 回调
-    nebula::rpc::RpcChannel channel_;                             // 这个 Worker 自己的 RPC/TCP 连接
-    DbCoroutineStub stub_;                                        // 通过 channel 发送数据库压测 RPC 的对象
-    const google::protobuf::MethodDescriptor* method_ = nullptr;  // 服务端 Execute 方法的描述信息
+    nebula::net::EventLoop loop_;                                 // 当前 Worker 的事件循环，负责驱动 RPC IO 和协程恢复
+    nebula::rpc::RpcChannel channel_;                             // 当前 Worker 独占的一条 RPC/TCP 连接
+    DbCoroutineStub stub_;                                        // 把 Protobuf 请求发送到服务端 Execute 方法的客户端对象
+    const google::protobuf::MethodDescriptor* method_ = nullptr;  // Execute 方法的 Protobuf 描述信息
 
-    std::uint64_t next_request_ = 0;                              // 下一条要发送的请求序号
-    std::size_t in_flight_ = 0;                                   // 当前已发出、还没收到响应的 RPC 数量
-    std::size_t active_lanes_ = 0;                                // 还没有完成的 Lane 数量
+    std::uint64_t next_request_ = 0;                              // 下一个尚未分配给 Lane 的请求序号
+    std::size_t in_flight_ = 0;                                   // 已提交但还没有收到 RPC 响应的请求数量
+    std::size_t active_lanes_ = 0;                                // 尚未结束的 Lane 数量；归零后本 Worker 才能退出
 
-    bool announced_ready_ = false;                                // 是否已经报告准备完成，防止 ready 被重复加一
-    bool started_ = false;                                        // 这个 Worker 是否已经进入正式测试
+    bool announced_ready_ = false;                                // 是否已经向主线程报告准备状态，防止重复报告
+    bool started_ = false;                                        // 是否已经进入正式计时阶段
 
     Stats stats_;
 
-    nebula::coro::Task<int> setup_task_;                          // 负责连接和启动 Lane；它会先于 channel_ 析构
-    std::vector<nebula::coro::Task<int>> lane_tasks_;             // 保存这个 Worker 启动的所有 Lane 协程
+    nebula::coro::Task<int> setup_task_;                          // 保存启动协程，确保其协程帧在 channel_ 析构前结束
+    std::vector<nebula::coro::Task<int>> lane_tasks_;             // 保存所有 Lane 协程，便于结束时检查返回值和异常
 };
 
+// 输入必须已经按从小到大排好序。
+// 例如 percent=0.95 时，取排序后位于 95% 位置的样本作为 P95。
 template <typename T>
 T Percentile(const std::vector<T>& sorted, double percent)
 {
@@ -579,6 +625,8 @@ T Percentile(const std::vector<T>& sorted, double percent)
     return sorted[index];
 }
 
+// 汇总所有 Worker 的结果，计算吞吐量、延迟分位数，并按需追加写入 CSV。
+// 本轮只有请求全部成功、没有超时/取消/未完成请求时，程序才返回 0。
 int Report(const Options& o, std::vector<Stats>& results)
 {
     std::vector<std::int64_t> latencies;                  // 合并所有 Worker 的 RPC 耗时样本
@@ -650,15 +698,18 @@ int Report(const Options& o, std::vector<Stats>& results)
     std::sort(database_call_samples_us.begin(), database_call_samples_us.end());
     std::sort(db_queue_wait_samples_us.begin(), db_queue_wait_samples_us.end());
 
+    // 用最早开始的 Worker 和最晚结束的 Worker 计算整轮实际运行时间，避免把线程启动时间算进压测区间。
     const double wall_seconds =
         earliest_start != TimePoint{} && latest_stop > earliest_start
         ? std::chrono::duration<double>(latest_stop - earliest_start).count()
         : 0.0;                                 // 整轮测试耗时，从最早开始到最晚结束，单位秒
 
+    // 吞吐量只计算成功完成的请求，不把失败、超时或尚未完成的请求算进去。
     const double success_qps = wall_seconds > 0.0
         ? static_cast<double>(succeeded) / wall_seconds
         : 0.0;                                 // 每秒成功完成的请求数
 
+    // RPC 延迟样本只记录成功请求；数据库调用耗时和 DB 队列等待耗时分别统计。
     const double avg_us = !latencies.empty()
         ? std::accumulate(latencies.begin(), latencies.end(), 0.0) /
             static_cast<double>(latencies.size()) / 1000.0
@@ -690,6 +741,7 @@ int Report(const Options& o, std::vector<Stats>& results)
     const double db_queue_wait_p99_us = static_cast<double>(Percentile(db_queue_wait_samples_us, 0.99));
     const double db_queue_wait_p999_us = static_cast<double>(Percentile(db_queue_wait_samples_us, 0.999));
 
+    // 所有 Worker 的最大在途请求总数，便于和服务端实际承载量对照。
     const std::uint64_t total_inflight =
         static_cast<std::uint64_t>(o.workers) *
         static_cast<std::uint64_t>(o.window);  // 所有 Worker 合起来最多同时等待响应的 RPC 数量
@@ -732,6 +784,7 @@ int Report(const Options& o, std::vector<Stats>& results)
 
     if (!o.csv.empty())
     {
+        // CSV 采用追加写入；只有新文件或空文件才先写一次表头。
         std::ifstream old(o.csv, std::ios::binary | std::ios::ate);
         const bool write_header = !old.good() || old.tellg() == std::streampos(0);  // CSV 是新文件或空文件时，先写列名
 
@@ -791,23 +844,27 @@ int Report(const Options& o, std::vector<Stats>& results)
 
 }  // namespace
 
+// 主线程负责创建 Worker、等待所有连接准备完成、统一开始压测，并在最后汇总结果。
 int main(int argc, char** argv)
 {
     try
     {
-        const Options options = ParseOptions(argc, argv);                                                // 读取本次压测的命令行配置
+        const Options options = ParseOptions(argc, argv);                                                // 读取并验证本次压测的命令行配置
 
         SharedStart shared;
-        std::vector<Stats> results(options.workers);                                                     // 每个 Worker 各保存一份统计结果
-        std::vector<std::thread> threads;                                                                // 保存所有 Worker 线程，最后逐个 join
+        std::vector<Stats> results(options.workers);                                                     // 每个 Worker 单独保存统计，避免多个线程同时写同一份结果
+        std::vector<std::thread> threads;                                                                // 保存所有 Worker 线程，最后逐个等待它们结束
         threads.reserve(options.workers);
 
         for (std::size_t i = 0; i < options.workers; ++i)
         {
-            const std::uint64_t per_worker = options.requests / options.workers;                         // 每个 Worker 先分到的基础请求数
-            const std::uint64_t remainder = options.requests % options.workers;                          // 除不尽的请求数，依次多分给前面的 Worker
-            const std::uint64_t count = per_worker + (i < remainder ? 1ULL : 0ULL);                      // 这个 Worker 最终要发送的请求数
-            const std::uint64_t base_sequence = per_worker * i + std::min<std::uint64_t>(i, remainder);  // 给每个 Worker 分配不重叠的 key 编号范围
+            // 把总请求数尽量平均分给 Worker。不能整除时，前 remainder 个 Worker 各多分一个请求。
+            const std::uint64_t per_worker = options.requests / options.workers;
+            const std::uint64_t remainder = options.requests % options.workers;
+            const std::uint64_t count = per_worker + (i < remainder ? 1ULL : 0ULL);
+
+            // 为每个 Worker 分配互不重叠的 key 区间，INSERT/DELETE 就不会因为不同线程而使用相同 key。
+            const std::uint64_t base_sequence = per_worker * i + std::min<std::uint64_t>(i, remainder);
 
             threads.emplace_back([&, i, count, base_sequence]
                 {
@@ -827,8 +884,9 @@ int main(int argc, char** argv)
 
         const TimePoint ready_deadline = Clock::now() +
             std::chrono::milliseconds(options.connect_timeout_ms) +
-            std::chrono::seconds(30);  // 等待所有 Worker 建立连接并报告准备状态的截止时刻
+            std::chrono::seconds(30);  // 连接超时时间之外再留 30 秒，等待所有 Worker 报告准备状态
 
+        // 所有 Worker 都准备好后再统一开始，减少不同线程启动时间不同对吞吐量统计的影响。
         while (shared.ready.load(std::memory_order_acquire) < options.workers &&
                Clock::now() < ready_deadline)
         {

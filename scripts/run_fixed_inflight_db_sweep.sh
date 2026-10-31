@@ -26,11 +26,11 @@ REQUESTS_INSERT=1000000
 REQUESTS_DELETE=1000000
 
 DB_HOST="${DB_HOST:-127.0.0.1}"
-DB_PORT="${DB_PORT:-3306}"
+DB_PORT="${DB_PORT:-5432}"
 DB_USER="${DB_USER:-ordersystem_bench}"
 DB_NAME="${DB_NAME:-ordersystem_bench}"
 if [[ -z "${DB_PASSWORD+x}" ]]; then
-    read -rsp "MySQL password for ${DB_USER}: " DB_PASSWORD
+    read -rsp "PostgreSQL password for ${DB_USER}: " DB_PASSWORD
     echo
 fi
 export DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME
@@ -38,13 +38,13 @@ export DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME
 for executable in "$SERVER" "$CLIENT"; do
     if [[ ! -x "$executable" ]]; then
         echo "Executable not found: $executable" >&2
-        echo "Build OrderSystem first; see docs/database-operation-benchmark.md" >&2
+        echo "Build OrderSystem first: cmake --preset linux-release && cmake --build --preset build-linux-release" >&2
         exit 2
     fi
 done
 
-if ! command -v mysql >/dev/null 2>&1; then
-    echo "mysql client not found. Install the MySQL command-line client first." >&2
+if ! command -v psql >/dev/null 2>&1; then
+    echo "psql client not found. Install the PostgreSQL client first." >&2
     exit 2
 fi
 
