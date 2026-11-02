@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+
+# 用途：快速确认 PostgreSQL 的 READ、INSERT、UPDATE、DELETE 四种操作都能正常完成。
+# 默认测试配置：客户端 4 个 Worker，每个连接 Window=8，总在途请求数为 32；每种操作执行 1,000 次。
+# 测试顺序：
+# 1. READ：重置压测表，启动客户端，只发送 READ 请求，检查读取表记录数。
+# 2. INSERT：再次重置压测表，只发送 INSERT 请求，检查插入表记录数。
+# 3. UPDATE：再次重置压测表，只发送 UPDATE 请求，检查更新表记录数。
+# 4. DELETE：再次重置压测表，只发送 DELETE 请求，检查删除表记录数。
+# 每种操作单独启动一次客户端，因此一次客户端运行只测试一种操作。
+# 脚本会检查 PostgreSQL；如果 RPC 服务端未运行就自动启动，若复用已有服务端则不会关闭它。
+# 测试日志和 CSV 保存在 ~/rpc-bench/ 下。脚本只会关闭自己启动的服务端。
+
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -1,4 +1,15 @@
 #!/usr/bin/env bash
+
+# 用途：在较高固定并发下，分别测试 PostgreSQL 的 READ、UPDATE、INSERT、DELETE，并检查操作结果。
+# 默认客户端配置：4 个 Worker、每个连接 Window=512，总在途 RPC 请求数为 2,048。
+# 默认服务端配置：4 个 IO 线程、16 个 DB Worker；默认尝试将服务端绑到 CPU 0-3、客户端绑到 CPU 4-7。
+# 默认请求数量：READ 1,000,000 次；UPDATE、INSERT、DELETE 各 200,000 次；默认每种操作测试 1 轮。
+# 测试顺序：READ → UPDATE → INSERT → DELETE。每种操作单独启动一次客户端，因此一次客户端运行只发送一种操作。
+# 每轮开始前重置压测表，执行客户端请求，再检查对应数据表的最终记录数。
+# RPC 服务端未运行时脚本会自动启动；如果已经有服务端在运行，则复用它，不会擅自关闭。
+# 脚本只会清理自己启动的服务端，并把 CSV、客户端日志、服务端日志和环境配置保存在 ~/rpc-bench/ 下。
+# 注意：脚本会重置压测表，默认只允许连接 ordersystem_bench 专用数据库；不要对真实业务数据库运行。
+
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

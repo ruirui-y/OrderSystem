@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Install the Ubuntu build and PostgreSQL development environment for OrderSystem.
+
+# 用途：准备 OrderSystem 在 Ubuntu 上的编译和 PostgreSQL 开发环境。
+# 主要工作：
+# 1. 检查当前系统是否为 Ubuntu 22.04 或更新版本，并确认可以使用 sudo。
+# 2. 安装 C++ 编译工具、CMake、Ninja、Protobuf、spdlog、PostgreSQL 和 libpq 开发文件。
+# 3. 检查关键工具和头文件是否安装成功，并尝试启用 PostgreSQL 服务。
+# 注意：本脚本只安装和检查环境，不会创建 ordersystem_bench 用户、数据库、数据表或测试数据。
 
 set -Eeuo pipefail
 
