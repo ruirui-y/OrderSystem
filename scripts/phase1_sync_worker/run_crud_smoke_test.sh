@@ -13,7 +13,7 @@
 
 set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="$ROOT/build/linux-release/bin"
 SERVER_HOST="${RPC_HOST:-127.0.0.1}"
 SERVER_PORT="${RPC_PORT:-9000}"
@@ -33,7 +33,7 @@ DB_NAME="${DB_NAME:-ordersystem_bench}"
 
 SERVER="$BIN/order_db_benchmark_server"
 CLIENT="$BIN/order_db_benchmark_client"
-RESET_SCRIPT="$ROOT/scripts/reset_benchmark_tables.sh"
+RESET_SCRIPT="$ROOT/scripts/common/reset_benchmark_tables.sh"
 
 fail()
 {

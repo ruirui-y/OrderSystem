@@ -15,7 +15,7 @@
 
 set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="$ROOT/build/linux-release/bin"
 SERVER="$BIN/order_db_benchmark_server"
 CLIENT="$BIN/order_db_benchmark_client"
@@ -169,7 +169,7 @@ run_operation()
     stop_server
 
     DB_HOST="$DB_HOST" DB_PORT="$DB_PORT" DB_USER="$DB_USER" DB_PASSWORD="$DB_PASSWORD" DB_NAME="$DB_NAME" \
-        "$ROOT/scripts/reset_benchmark_tables.sh" \
+        "$ROOT/scripts/common/reset_benchmark_tables.sh" \
         > "$OUTDIR/reset_${operation}_run${repeat}.log" 2>&1
 
     # 每次重置表后重新启动服务端，让预处理语句在表重置完成后重新创建。

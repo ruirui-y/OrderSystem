@@ -15,12 +15,17 @@ DB_PORT="${DB_PORT:-5432}"
 DB_USER="${DB_USER:-ordersystem_bench}"
 DB_NAME="${DB_NAME:-ordersystem_bench}"
 
-if [[ -z "${DB_PASSWORD+x}" ]]; then
+# 已经有 ~/.pgpass 时不再要求输入密码，交给 psql 自己读文件。
+if [[ -z "${DB_PASSWORD:-}" && ! -f "$HOME/.pgpass" ]]; then
     read -rsp "PostgreSQL password for ${DB_USER}: " DB_PASSWORD
     echo
 fi
 
-export PGPASSWORD="$DB_PASSWORD"
+# 只有确实拿到密码才设置 PGPASSWORD。空的 PGPASSWORD 会被当成空密码，
+# 反而挡住 ~/.pgpass 的自动读取，导致认证失败。
+if [[ -n "${DB_PASSWORD:-}" ]]; then
+    export PGPASSWORD="$DB_PASSWORD"
+fi
 psql \
     --no-psqlrc \
     --set ON_ERROR_STOP=1 \
