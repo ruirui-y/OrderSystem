@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ordersystem/database/database_types.h"
+
 #include "nebula/net/event_loop.h"
 
 #include <libpq-fe.h>
@@ -19,40 +21,8 @@
 namespace ordersystem::benchmark
 {
 
-enum class DbOperation
-{
-    Read,
-    Insert,
-    Update,
-    Delete
-};
-
-// key 对应记录 ID，value 只在 Insert 时使用。
-struct DbRequest
-{
-    DbOperation operation{};
-    std::uint64_t key{0};
-    std::uint64_t value{0};
-};
-
-struct DbResult
-{
-    bool success{false};
-    std::uint64_t value{0};
-    std::string error;
-
-    std::uint64_t queue_wait_us{0};                                                 // 请求在 DB Worker 队列中等待的时间，单位：微秒
-    std::uint64_t database_call_us{0};                                              // 执行 SQL 到拿到数据库结果的时间，单位：微秒
-};
-
-struct DbConfig
-{
-    std::string host{"127.0.0.1"};
-    std::uint16_t port{5432};
-    std::string user{"ordersystem_bench"};
-    std::string password;
-    std::string database{"ordersystem_bench"};
-};
+// DbOperation、DbRequest、DbResult、DbConfig 统一定义在 database_types.h。
+// 阶段 1 的 Worker 池和阶段 2 的 EventLoop 连接共用同一套请求与结果类型。
 
 // 每条连接提前准备四条 SQL，后续执行时只需要传入参数。
 // 当前使用同步接口，因此一条连接只能由一个 Worker 使用。
@@ -116,10 +86,10 @@ private:
 
 // 协程在这里提交数据库任务并挂起。
 // Worker 完成 SQL 后，将协程恢复任务投回原来的 EventLoop。
-class DbOperationAwaiter final
+class DbPoolOperationAwaiter final
 {
 public:
-    DbOperationAwaiter(DbPool& pool, nebula::net::EventLoop* loop, DbRequest request);
+    DbPoolOperationAwaiter(DbPool& pool, nebula::net::EventLoop* loop, DbRequest request);
 
     [[nodiscard]] bool await_ready() const noexcept;                                // 返回 false，让协程进入 await_suspend。
 

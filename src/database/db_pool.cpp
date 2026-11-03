@@ -453,7 +453,7 @@ void DbPool::WorkerMain()
 }
 
 // loop_ 必须有效，数据库操作完成后需要把协程恢复到它所属的 EventLoop。
-DbOperationAwaiter::DbOperationAwaiter(DbPool& pool,
+DbPoolOperationAwaiter::DbPoolOperationAwaiter(DbPool& pool,
                                        nebula::net::EventLoop* loop,
                                        DbRequest request)
     : pool_(pool),
@@ -467,13 +467,13 @@ DbOperationAwaiter::DbOperationAwaiter(DbPool& pool,
 }
 
 // 数据库任务交给 Worker 执行，因此这里始终返回 false。
-bool DbOperationAwaiter::await_ready() const noexcept
+bool DbPoolOperationAwaiter::await_ready() const noexcept
 {
     return false;
 }
 
 // 提交数据库任务并挂起协程；Worker 完成后，将恢复动作投回原来的 EventLoop。
-void DbOperationAwaiter::await_suspend(std::coroutine_handle<> continuation)
+void DbPoolOperationAwaiter::await_suspend(std::coroutine_handle<> continuation)
 {
     // 统计任务从提交到 Worker 取出的等待时间，不包含 SQL 执行时间。
     const auto submitted_at = std::chrono::steady_clock::now();
@@ -507,7 +507,7 @@ void DbOperationAwaiter::await_suspend(std::coroutine_handle<> continuation)
         });
 }
 
-DbResult DbOperationAwaiter::await_resume() noexcept
+DbResult DbPoolOperationAwaiter::await_resume() noexcept
 {
     return std::move(result_);
 }
