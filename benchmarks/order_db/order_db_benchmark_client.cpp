@@ -232,7 +232,7 @@ struct Stats
 
     std::vector<std::int64_t> latency_ns;         // 成功请求的完整 RPC 耗时，单位是纳秒
     std::vector<std::uint32_t> database_call_us;  // 服务端记录的数据库调用耗时，单位是微秒
-    std::vector<std::uint32_t> db_queue_wait_us;  // 请求在数据库线程池中等待的时间，单位是微秒
+    std::vector<std::uint32_t> db_queue_wait_us;  // 请求等待当前 EventLoop 的 PostgreSQL 连接空闲的时间，单位是微秒
     std::string error;                            // Worker 启动或压测流程中的错误
     std::string db_error;                         // 数据库操作失败时服务端返回的错误信息
 };
@@ -631,7 +631,7 @@ int Report(const Options& o, std::vector<Stats>& results)
 {
     std::vector<std::int64_t> latencies;                  // 合并所有 Worker 的 RPC 耗时样本
     std::vector<std::uint32_t> database_call_samples_us;  // 合并所有 Worker 的数据库调用耗时样本（微秒）
-    std::vector<std::uint32_t> db_queue_wait_samples_us;  // 合并所有 Worker 的数据库排队耗时样本（微秒）
+    std::vector<std::uint32_t> db_queue_wait_samples_us;  // 合并所有请求等待各自 EventLoop 数据库连接的耗时样本（微秒）
 
     std::uint64_t issued = 0;
     std::uint64_t completed = 0;

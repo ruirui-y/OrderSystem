@@ -1,4 +1,3 @@
-#include "ordersystem/database/db_pool.h"
 #include "ordersystem/database/loop_database_context.h"
 
 #include "nebula/net/event_loop.h"
@@ -18,25 +17,21 @@
 namespace
 {
 
-// 缩短本文件中使用的数据库类型和 Protobuf 类型名称。
 using ordersystem::benchmark::DbConfig;
 using ordersystem::benchmark::DbOperation;
 using ordersystem::benchmark::DbOperationAwaiter;
-using ordersystem::benchmark::DbPool;
 using ordersystem::benchmark::DbRequest;
 using ordersystem::benchmark::DbResult;
 using ordersystem::benchmark::LoopDatabaseContext;
 using Request = ordersystem::benchmark::DbBenchmarkRequest;
 using Response = ordersystem::benchmark::DbBenchmarkResponse;
 
-// 环境变量未设置时，使用传入的默认值。
 std::string EnvironmentValue(const char* name, std::string fallback)
 {
     const char* value = std::getenv(name);
     return value == nullptr ? std::move(fallback) : std::string(value);
 }
 
-// 转换数字文本，并检查是否存在无法转换的尾部字符。
 std::uint64_t ParseNumber(const char* text, const char* name)
 {
     try
@@ -56,7 +51,6 @@ std::uint64_t ParseNumber(const char* text, const char* name)
     }
 }
 
-// 从环境变量读取 PostgreSQL 连接配置，密码只从 DB_PASSWORD 获取。
 DbConfig ReadDbConfig()
 {
     DbConfig config;
@@ -74,7 +68,6 @@ DbConfig ReadDbConfig()
     return config;
 }
 
-// 转换 RPC 请求，并提前检查 PostgreSQL BIGINT 的取值范围。
 DbRequest ConvertRequest(const Request& request)
 {
     DbRequest result;
@@ -103,7 +96,8 @@ DbRequest ConvertRequest(const Request& request)
     {
         throw std::invalid_argument("database key must be between 1 and PostgreSQL BIGINT max");
     }
-    if (result.operation == DbOperation::Insert && result.value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+    if (result.operation == DbOperation::Insert &&
+        result.value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
     {
         throw std::invalid_argument("database value exceeds PostgreSQL BIGINT max");
     }
@@ -112,47 +106,39 @@ DbRequest ConvertRequest(const Request& request)
 
 }  // namespace
 
-// 启动压测服务端，初始化数据库线程池并注册协程 RPC 服务。
+// 阶段 2：每个 IO EventLoop 自己持有一条 PostgreSQL 连接。
+// RPC 请求不会再切到 DB Worker，SQL 的发送和结果读取都由当前 EventLoop 驱动。
 int main(int argc, char** argv)
 {
     try
     {
-        // 参数依次为 RPC 端口、IO 线程数和数据库 Worker 数量；阶段 1 仍保留 DB Worker。
         const std::uint64_t port_value = argc > 1 ? ParseNumber(argv[1], "port") : 9000;
         const std::uint64_t io_threads_value = argc > 2 ? ParseNumber(argv[2], "io_threads") : 4;
-        const std::uint64_t db_workers_value = argc > 3 ? ParseNumber(argv[3], "db_workers") : 16;
 
-        if (port_value == 0 || port_value > 65535 || io_threads_value == 0 ||
-            io_threads_value > 128 || db_workers_value == 0 || db_workers_value > 512)
+        if (port_value == 0 || port_value > 65535 || io_threads_value == 0 || io_threads_value > 128)
         {
-            throw std::invalid_argument("port, io_threads or db_workers is outside the supported range");
+            throw std::invalid_argument("port or io_threads is outside the supported range");
         }
 
         const DbConfig db_config = ReadDbConfig();
-
-        // 先建立全部数据库连接，连接初始化失败时不启动 RPC 服务。
-        DbPool db_pool(db_config, static_cast<std::size_t>(db_workers_value));
         nebula::net::EventLoop loop;
 
-        // 数据库操作通过 co_await 挂起当前 RPC 协程，不阻塞处理网络事件的 EventLoop。
         nebula::rpc::CoroutineService service(ordersystem::benchmark::DbBenchmarkService::descriptor());
         service.Register<Request, Response>(
             "Execute",
-            [&db_pool](nebula::rpc::RpcServerContext& context, const Request& request) -> nebula::coro::Task<Response>
+            [](nebula::rpc::RpcServerContext& context, const Request& request) -> nebula::coro::Task<Response>
             {
                 Response response;
 
-                // 阶段 1 中上下文只记录当前 IO Loop；实际数据库连接仍由 DbPool 的 Worker 持有。
-                LoopDatabaseContext* loop_database = context.Loop()->GetContext<LoopDatabaseContext>();
-                if (loop_database == nullptr)
+                LoopDatabaseContext* database = context.Loop()->GetContext<LoopDatabaseContext>();
+                if (database == nullptr)
                 {
                     response.set_success(false);
                     response.set_error("current IO Loop has no database context");
                     co_return response;
                 }
-                loop_database->AssertInOwnerLoop();
+                database->AssertInOwnerLoop();
 
-                // 参数检查放在提交任务之前，避免无效请求占用数据库 Worker。
                 DbRequest db_request;
                 try
                 {
@@ -165,8 +151,9 @@ int main(int argc, char** argv)
                     co_return response;
                 }
 
-                // Worker 完成 SQL 后，将协程恢复任务投回原来的 IO Loop。
-                DbResult result = co_await DbOperationAwaiter(db_pool, context.Loop(), db_request);
+                // await_suspend() 只把请求交给当前 EventLoop 的数据库上下文，然后立即挂起。
+                // PostgreSQL socket 可读后，同一个 EventLoop 再恢复这个 RPC 协程。
+                DbResult result = co_await DbOperationAwaiter(*database, db_request);
                 response.set_success(result.success);
                 response.set_value(result.value);
                 response.set_error(result.error);
@@ -178,18 +165,19 @@ int main(int argc, char** argv)
         nebula::rpc::RpcServer server(&loop, "0.0.0.0", static_cast<std::uint16_t>(port_value));
         server.RegisterCoroutineService(&service);
 
-        // 每个 IO Loop 保存自己的上下文，阶段 1 不在这里创建数据库连接。
+        // 每个负责 RPC 连接的 IO Loop 启动前建立一条自己的 PostgreSQL 连接。
+        // 连接建立和预处理语句初始化仍在启动阶段同步完成；RPC 请求执行阶段已经全部改成非阻塞。
         server.SetIoLoopInitCallback([db_config](nebula::net::EventLoop* io_loop)
             {
                 io_loop->SetContext(std::make_unique<LoopDatabaseContext>(io_loop, db_config));
             });
         server.Start(static_cast<std::size_t>(io_threads_value));
 
-        // 输出本次运行配置，不打印数据库密码。
         std::cout << "OrderSystem PostgreSQL benchmark server started"
                   << " port=" << port_value
                   << " io_threads=" << io_threads_value
-                  << " db_workers=" << db_pool.WorkerCount()
+                  << " db_connections=" << io_threads_value
+                  << " db_mode=event_loop_nonblocking"
                   << " db_host=" << EnvironmentValue("DB_HOST", "127.0.0.1")
                   << " db_port=" << db_config.port
                   << " db_name=" << EnvironmentValue("DB_NAME", "ordersystem_bench")

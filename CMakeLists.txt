@@ -47,10 +47,10 @@ add_library(order_db_benchmark_proto STATIC
 target_include_directories(order_db_benchmark_proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(order_db_benchmark_proto PUBLIC protobuf::libprotobuf)
 
-# 服务端把数据库操作交给固定数量的数据库线程，避免阻塞 RPC 的 EventLoop。
+# 阶段 2：每个 IO EventLoop 自己驱动一条非阻塞 PostgreSQL 连接，不再创建 DB Worker 线程池。
 add_executable(order_db_benchmark_server
     benchmarks/order_db/order_db_benchmark_server.cpp
-    src/database/db_pool.cpp
+    src/database/loop_database_context.cpp
 )
 target_include_directories(order_db_benchmark_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(order_db_benchmark_server PRIVATE nebula_rpc order_db_benchmark_proto PkgConfig::LIBPQ Threads::Threads)
