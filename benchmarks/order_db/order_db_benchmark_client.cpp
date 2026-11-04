@@ -13,6 +13,7 @@
 // 第一批请求先写入 RpcChannel 的发送缓冲区，再统一 Flush（真正提交发送）；
 // 后续响应到达时，RpcChannel 会恢复完成的协程，并把新请求合并后再发送。
 
+#include "nebula/base/logger.h"
 #include "nebula/net/event_loop.h"
 #include "nebula/rpc/rpc_channel.h"
 #include "nebula/rpc/rpc_coroutine.h"
@@ -425,6 +426,9 @@ private:
                 request.set_key(mixed_key % kSeedRowCount + 1);
             }
 
+            // 请求对象随后会被 move 进 Call，先把 key 留下来给超时日志使用。
+            const std::uint64_t logged_key = request.key();
+
             nebula::rpc::RpcCallOptions options;
             options.timeout = std::chrono::milliseconds(opts_.timeout_ms);
             // 当前 Lane 只负责把请求写入 RpcChannel 的发送缓冲区，不立即触发 socket 写入。
@@ -453,6 +457,11 @@ private:
                 if (result.State() == nebula::rpc::RpcCallState::Timeout)
                 {
                     ++stats_.timed_out;
+                    NLOG_WARN("[client] RPC timeout triggered key={} operation={} elapsed_us={}",
+                              logged_key,
+                              opts_.operation,
+                              std::chrono::duration_cast<std::chrono::microseconds>(
+                                  ended_at - sent_at).count());
                 }
                 else if (result.State() == nebula::rpc::RpcCallState::Cancelled)
                 {
