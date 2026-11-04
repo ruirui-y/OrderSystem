@@ -1,5 +1,6 @@
 #include "ordersystem/database/loop_database_context.h"
 
+#include "nebula/base/logger.h"
 #include "nebula/net/event_loop.h"
 #include "nebula/rpc/rpc_coroutine.h"
 #include "nebula/rpc/rpc_server.h"
@@ -106,10 +107,13 @@ DbRequest ConvertRequest(const Request& request)
 
 }  // namespace
 
-// 阶段 2：每个 IO EventLoop 自己持有一条 PostgreSQL 连接。
-// RPC 请求不会再切到 DB Worker，SQL 的发送和结果读取都由当前 EventLoop 驱动。
+// 阶段 3：每个 IO EventLoop 自己持有一条 PostgreSQL 连接，并通过 Pipeline 批量发送 SQL。
+// RPC 请求仍由所属 EventLoop 驱动，不再经过 DB Worker 线程。
 int main(int argc, char** argv)
 {
+    // 诊断运行结束后恢复 INFO 级别；DEBUG 日志只用于排查数据库链路。
+    nebula::base::InitLogger(spdlog::level::info);
+
     try
     {
         const std::uint64_t port_value = argc > 1 ? ParseNumber(argv[1], "port") : 9000;
@@ -121,6 +125,17 @@ int main(int argc, char** argv)
         }
 
         const DbConfig db_config = ReadDbConfig();
+        const std::uint64_t max_outstanding_value = ParseNumber(
+            EnvironmentValue("DB_MAX_OUTSTANDING_REQUESTS", "4096").c_str(),
+            "DB_MAX_OUTSTANDING_REQUESTS");
+
+        if (max_outstanding_value == 0 || max_outstanding_value > 1000000)
+        {
+            throw std::invalid_argument(
+                "DB_MAX_OUTSTANDING_REQUESTS must be between 1 and 1000000");
+        }
+
+        const std::size_t max_outstanding_requests = static_cast<std::size_t>(max_outstanding_value);
         nebula::net::EventLoop loop;
 
         nebula::rpc::CoroutineService service(ordersystem::benchmark::DbBenchmarkService::descriptor());
@@ -151,8 +166,8 @@ int main(int argc, char** argv)
                     co_return response;
                 }
 
-                // await_suspend() 只把请求交给当前 EventLoop 的数据库上下文，然后立即挂起。
-                // PostgreSQL socket 可读后，同一个 EventLoop 再恢复这个 RPC 协程。
+                // await_suspend() 把请求交给当前 EventLoop 的 Pipeline 队列后立即挂起。
+                // 对应结果和 Pipeline 同步点都收到后，同一个 EventLoop 再恢复这个 RPC 协程。
                 DbResult result = co_await DbOperationAwaiter(*database, db_request);
                 response.set_success(result.success);
                 response.set_value(result.value);
@@ -166,10 +181,11 @@ int main(int argc, char** argv)
         server.RegisterCoroutineService(&service);
 
         // 每个负责 RPC 连接的 IO Loop 启动前建立一条自己的 PostgreSQL 连接。
-        // 连接建立和预处理语句初始化仍在启动阶段同步完成；RPC 请求执行阶段已经全部改成非阻塞。
-        server.SetIoLoopInitCallback([db_config](nebula::net::EventLoop* io_loop)
+        // 连接建立和预处理语句初始化仍在启动阶段同步完成；请求阶段使用非阻塞 Pipeline。
+        server.SetIoLoopInitCallback([db_config, max_outstanding_requests](nebula::net::EventLoop* io_loop)
             {
-                io_loop->SetContext(std::make_unique<LoopDatabaseContext>(io_loop, db_config));
+                io_loop->SetContext(std::make_unique<LoopDatabaseContext>(
+                    io_loop, db_config, max_outstanding_requests));
             });
         server.Start(static_cast<std::size_t>(io_threads_value));
 
@@ -178,6 +194,9 @@ int main(int argc, char** argv)
                   << " io_threads=" << io_threads_value
                   << " db_connections=" << io_threads_value
                   << " db_mode=event_loop_nonblocking"
+                  << " db_pipeline_mode=enabled"
+                  << " db_pipeline_sync=one_per_loop_turn"
+                  << " db_max_outstanding_requests=" << max_outstanding_requests
                   << " db_host=" << EnvironmentValue("DB_HOST", "127.0.0.1")
                   << " db_port=" << db_config.port
                   << " db_name=" << EnvironmentValue("DB_NAME", "ordersystem_bench")

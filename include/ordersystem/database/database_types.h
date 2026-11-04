@@ -28,8 +28,8 @@ struct DbResult
     std::uint64_t value{0};
     std::string error;
 
-    std::uint64_t queue_wait_us{0};                                                 // 请求在数据库访问层排队的时间，单位：微秒（阶段 1 是等 DB Worker，阶段 2 是等所属 EventLoop 的连接）
-    std::uint64_t database_call_us{0};                                              // SQL 真正开始发送到完整收完结果的时间，单位：微秒
+    std::uint64_t queue_wait_us{0};                                                 // 请求从提交到写进 PostgreSQL 连接的时间，单位：微秒
+    std::uint64_t database_call_us{0};                                              // 请求发出到收到同步点、确认结果的时间，单位：微秒
 };
 
 struct DbConfig

@@ -1,12 +1,17 @@
 #include "ordersystem/database/loop_database_context.h"
 
+#include "nebula/base/logger.h"
+
 #include <charconv>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace ordersystem::benchmark
 {
@@ -23,6 +28,17 @@ constexpr std::uint64_t kPostgresBigintMax =
 
 using PgResult = std::unique_ptr<PGresult, decltype(&PQclear)>;
 
+// libpq 的错误信息末尾通常带换行，拼进异常消息或日志前先去掉。
+std::string TrimTrailingNewlines(std::string text)
+{
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+    {
+        text.pop_back();
+    }
+    return text;
+}
+
+// 优先使用结果自带的错误信息；结果本身没有说明时，退回连接级错误。
 std::string ResultError(PGconn* connection, PGresult* result)
 {
     const char* message = result == nullptr ? nullptr : PQresultErrorMessage(result);
@@ -36,12 +52,7 @@ std::string ResultError(PGconn* connection, PGresult* result)
         return "unknown PostgreSQL error";
     }
 
-    std::string error(message);
-    while (!error.empty() && (error.back() == '\n' || error.back() == '\r'))
-    {
-        error.pop_back();
-    }
-    return error;
+    return TrimTrailingNewlines(message);
 }
 
 bool ParseUnsigned(std::string_view text, std::uint64_t* value)
@@ -57,6 +68,8 @@ bool ParseUnsigned(std::string_view text, std::uint64_t* value)
     return error == std::errc{} && parsed_end == end;
 }
 
+// 把无符号整数转成 PostgreSQL 参数文本。key/value 在 ValidateRequest 里已经检查过上限，
+// 这里保留同样的检查作为最后一道防线：与其把超出 BIGINT 的值发出去，不如在这里失败。
 std::string BigintParameter(std::uint64_t value, const char* name)
 {
     if (value > kPostgresBigintMax)
@@ -66,15 +79,53 @@ std::string BigintParameter(std::uint64_t value, const char* name)
     return std::to_string(value);
 }
 
+// 日志里用可读名字标记数据库操作，避免只看到枚举下标。
+const char* OperationName(DbOperation operation)
+{
+    switch (operation)
+    {
+        case DbOperation::Read:
+            return "read";
+        case DbOperation::Insert:
+            return "insert";
+        case DbOperation::Update:
+            return "update";
+        case DbOperation::Delete:
+            return "delete";
+    }
+    return "unknown";
+}
+
+// spdlog 不能直接格式化 std::thread::id，先转成字符串。
+std::string ThreadId()
+{
+    std::ostringstream stream;
+    stream << std::this_thread::get_id();
+    return stream.str();
+}
+
+// 协程句柄本身不能直接打印，统一转成地址，方便在日志里对照同一个 continuation。
+std::uintptr_t ContinuationAddress(std::coroutine_handle<> continuation)
+{
+    return reinterpret_cast<std::uintptr_t>(continuation.address());
+}
+
 }  // namespace
 
-LoopDatabaseContext::LoopDatabaseContext(nebula::net::EventLoop* loop, DbConfig config)
+LoopDatabaseContext::LoopDatabaseContext(nebula::net::EventLoop* loop,
+                                         DbConfig config,
+                                         std::size_t max_outstanding_requests)
     : loop_(loop),
-      config_(std::move(config))
+      config_(std::move(config)),
+      max_outstanding_requests_(max_outstanding_requests)
 {
     if (loop_ == nullptr)
     {
         throw std::invalid_argument("LoopDatabaseContext requires an EventLoop");
+    }
+    if (max_outstanding_requests_ == 0)
+    {
+        throw std::invalid_argument("database outstanding request limit must be greater than zero");
     }
 
     loop_->AssertInLoopThread();
@@ -96,8 +147,6 @@ void LoopDatabaseContext::AssertInOwnerLoop() const
     loop_->AssertInLoopThread();
 }
 
-// 阶段 2 先把“请求执行路径”改成完全非阻塞。
-// 建连、设置编码和准备四条固定 SQL 仍在 IO Loop 启动前同步完成，只发生一次，不参与每次 RPC 的热路径。
 void LoopDatabaseContext::ConnectAndPrepare()
 {
     const std::string port = std::to_string(config_.port);
@@ -118,32 +167,30 @@ void LoopDatabaseContext::ConnectAndPrepare()
         config_.password.empty() ? nullptr : config_.password.c_str(),
         config_.database.c_str(),
         "5",
-        "ordersystem_db_benchmark_async",
+        "ordersystem_db_benchmark_pipeline",
         nullptr
     };
 
-    connection_ = PQconnectdbParams(keywords, values, 0);
-    if (connection_ == nullptr)
-    {
-        throw std::runtime_error("allocate PostgreSQL connection failed");
-    }
-
-    if (PQstatus(connection_) != CONNECTION_OK)
-    {
-        const std::string error = ConnectionError();
-        Close();
-        throw std::runtime_error("connect to PostgreSQL: " + error);
-    }
-
-    if (PQsetClientEncoding(connection_, "UTF8") != 0)
-    {
-        const std::string error = ConnectionError();
-        Close();
-        throw std::runtime_error("set PostgreSQL client encoding: " + error);
-    }
-
+    // 建连、设置编码、准备语句、切换非阻塞和 Pipeline 属于同一次初始化，
+    // 任何一步失败都交给下面的 catch 统一释放已经建立的连接。
     try
     {
+        connection_ = PQconnectdbParams(keywords, values, 0);
+        if (connection_ == nullptr)
+        {
+            throw std::runtime_error("allocate PostgreSQL connection failed");
+        }
+
+        if (PQstatus(connection_) != CONNECTION_OK)
+        {
+            throw std::runtime_error("connect to PostgreSQL: " + ConnectionError());
+        }
+
+        if (PQsetClientEncoding(connection_, "UTF8") != 0)
+        {
+            throw std::runtime_error("set PostgreSQL client encoding: " + ConnectionError());
+        }
+
         Prepare(kReadStatement,
                 "ordersystem_read",
                 "SELECT value FROM bench_read_records WHERE id = $1",
@@ -161,11 +208,15 @@ void LoopDatabaseContext::ConnectAndPrepare()
                 "DELETE FROM bench_delete_records WHERE id = $1",
                 1);
 
-        // 从这里开始，请求执行只能走 PQsend*/PQconsumeInput/PQgetResult 这一套异步接口。
-        // PQexec/PQexecPrepared 即使连接被设成 nonblocking 也仍然会阻塞，因此阶段 2 不再调用它们。
         if (PQsetnonblocking(connection_, 1) != 0)
         {
             throw std::runtime_error("enable PostgreSQL nonblocking mode: " + ConnectionError());
+        }
+
+        // 预处理语句已经在普通模式下准备完成。进入 Pipeline 后只使用异步发送接口。
+        if (PQenterPipelineMode(connection_) != 1)
+        {
+            throw std::runtime_error("enter PostgreSQL pipeline mode: " + ConnectionError());
         }
 
         const int socket_fd = PQsocket(connection_);
@@ -191,8 +242,6 @@ void LoopDatabaseContext::ConnectAndPrepare()
             {
                 OnSocketError();
             });
-
-        // 平时始终关心数据库返回的数据；只有 PQflush() 表示还有数据没写完时才额外监听可写事件。
         channel_->EnableReading();
     }
     catch (...)
@@ -228,13 +277,6 @@ void LoopDatabaseContext::Submit(DbRequest request,
         throw std::invalid_argument("database result storage must not be null");
     }
 
-    PendingRequest pending{
-        request,
-        continuation,
-        result,
-        Clock::now()
-    };
-
     if (connection_failed_)
     {
         *result = {false, 0, connection_failure_};
@@ -242,62 +284,111 @@ void LoopDatabaseContext::Submit(DbRequest request,
         return;
     }
 
-    pending_requests_.push_back(std::move(pending));
-    StartNextRequest();
-}
+    // 在途请求和已出结果但还没等到同步点的请求都占名额，避免连接上的请求无限增长。
+    if (in_flight_requests_.size() + completed_requests_.size() >= max_outstanding_requests_)
+    {
+        *result = {false, 0, "database request queue is full"};
+        ResumeLater(continuation);
+        return;
+    }
 
-// 阶段 2 不使用 Pipeline，因此同一条连接上只有 active_request_ 这一条 SQL 在途。
-// 其他 RPC 请求只在当前 EventLoop 自己的队列里等待，不需要 mutex 和 condition_variable。
-void LoopDatabaseContext::StartNextRequest()
-{
-    loop_->AssertInLoopThread();
+    const std::string validation_error = ValidateRequest(request);
+    if (!validation_error.empty())
+    {
+        *result = {false, 0, validation_error};
+        ResumeLater(continuation);
+        return;
+    }
 
-    if (connection_failed_ || active_request_.has_value() || pending_requests_.empty())
+    const TimePoint now = Clock::now();
+    InFlightRequest in_flight;
+    in_flight.request = std::move(request);
+    in_flight.continuation = continuation;
+    in_flight.result = result;
+    in_flight.submitted_at = now;
+    in_flight.sent_at = now;
+    in_flight_requests_.push_back(std::move(in_flight));
+
+    NLOG_DEBUG("[db] Submit op={} key={} cont=0x{:x} tid={} inflight={} completed={} "
+               "sync_pending={} sync_scheduled={}",
+               OperationName(in_flight_requests_.back().request.operation),
+               in_flight_requests_.back().request.key,
+               ContinuationAddress(continuation),
+               ThreadId(),
+               in_flight_requests_.size(),
+               completed_requests_.size(),
+               sync_pending_,
+               sync_scheduled_);
+
+    // 每个请求到达就立刻发送，不等待凑够固定数量。这里只负责发出去，
+    // 结果由 OnReadable 异步取回，Submit 本身不阻塞。
+    if (!SendInFlightRequest(in_flight_requests_.back()))
     {
         return;
     }
 
-    active_request_.emplace(std::move(pending_requests_.front()));
-    pending_requests_.pop_front();
-    active_result_.reset();
-    active_started_at_ = Clock::now();
+    SchedulePipelineSync();
+}
 
-    active_request_->result->queue_wait_us = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            active_started_at_ - active_request_->submitted_at).count());
-
-    if (!SendActiveRequest())
+// 同一轮事件处理里可能连续提交多个请求。QueueInLoop 的语义是"当前这一轮处理结束后再执行"，
+// 所以这里只排一次队，让本轮发出的所有请求共用同一个同步点，而不是每条 SQL 都发一次 Sync。
+void LoopDatabaseContext::SchedulePipelineSync()
+{
+    if (connection_failed_ || sync_scheduled_)
     {
+        return;
+    }
+
+    sync_scheduled_ = true;
+    sync_pending_ = true;
+
+    NLOG_DEBUG("[db] SchedulePipelineSync tid={} inflight={} completed={} sync_pending={} "
+               "sync_scheduled={}",
+               ThreadId(),
+               in_flight_requests_.size(),
+               completed_requests_.size(),
+               sync_pending_,
+               sync_scheduled_);
+
+    loop_->QueueInLoop([this]
+        {
+            sync_scheduled_ = false;
+            SendPipelineSync();
+        });
+}
+
+void LoopDatabaseContext::SendPipelineSync()
+{
+    if (connection_failed_ || !sync_pending_)
+    {
+        return;
+    }
+
+    sync_pending_ = false;
+
+    const int sync_result = PQpipelineSync(connection_);
+    NLOG_DEBUG("[db] SendPipelineSync PQpipelineSync={} inflight={} completed={} tid={}",
+               sync_result,
+               in_flight_requests_.size(),
+               completed_requests_.size(),
+               ThreadId());
+
+    if (sync_result != 1)
+    {
+        FailConnection("send PostgreSQL pipeline sync: " + ConnectionError());
         return;
     }
 
     FlushOutput();
 }
 
-bool LoopDatabaseContext::SendActiveRequest()
+bool LoopDatabaseContext::SendInFlightRequest(InFlightRequest& request)
 {
-    if (!active_request_.has_value())
-    {
-        return false;
-    }
-
-    if (PQstatus(connection_) != CONNECTION_OK)
-    {
-        FailConnection("PostgreSQL connection is not available: " + ConnectionError());
-        return false;
-    }
-
-    const DbRequest& request = active_request_->request;
-
-    if (request.key == 0 || request.key > kPostgresBigintMax)
-    {
-        CompleteActive({false, 0, "database key must be between 1 and PostgreSQL BIGINT max"});
-        return false;
-    }
+    const DbRequest& db_request = request.request;
 
     std::size_t statement_index = kReadStatement;
     int parameter_count = 1;
-    switch (request.operation)
+    switch (db_request.operation)
     {
         case DbOperation::Read:
             statement_index = kReadStatement;
@@ -313,45 +404,50 @@ bool LoopDatabaseContext::SendActiveRequest()
             statement_index = kDeleteStatement;
             break;
         default:
-            CompleteActive({false, 0, "unsupported database operation"});
+            FailConnection("unsupported database operation reached the pipeline sender");
             return false;
     }
 
     try
     {
-        const std::string key = BigintParameter(request.key, "database key");
-        const std::string value = request.operation == DbOperation::Insert
-            ? BigintParameter(request.value, "database value")
+        const std::string key = BigintParameter(db_request.key, "database key");
+        const std::string value = db_request.operation == DbOperation::Insert
+            ? BigintParameter(db_request.value, "database value")
             : std::string{};
         const char* parameters[] = {key.c_str(), value.c_str()};
 
-        // 这里只把 SQL 请求交给 libpq 的输出缓冲区，不等待 PostgreSQL 返回。
-        // 真正的结果稍后由 socket 可读事件进入 OnReadable()。
-        if (PQsendQueryPrepared(connection_,
-                                statement_names_[statement_index],
-                                parameter_count,
-                                parameters,
-                                nullptr,
-                                nullptr,
-                                0) != 1)
+        const int send_result = PQsendQueryPrepared(connection_,
+                                                   statement_names_[statement_index],
+                                                   parameter_count,
+                                                   parameters,
+                                                   nullptr,
+                                                   nullptr,
+                                                   0);
+
+        NLOG_DEBUG("[db] SendInFlightRequest op={} key={} PQsendQueryPrepared={} inflight={} "
+                   "completed={} sync_pending={}",
+                   OperationName(db_request.operation),
+                   db_request.key,
+                   send_result,
+                   in_flight_requests_.size(),
+                   completed_requests_.size(),
+                   sync_pending_);
+
+        if (send_result != 1)
         {
-            // 当前只有在上一条命令已经完整结束后才会走到这里。
-            // 因此发送失败不再把它当成某一个请求的普通业务错误，而是直接认为这条连接已经不可继续使用。
-            FailConnection("send PostgreSQL query: " + ConnectionError());
+            FailConnection("send PostgreSQL pipeline query: " + ConnectionError());
             return false;
         }
     }
     catch (const std::exception& error)
     {
-        CompleteActive({false, 0, error.what()});
+        FailConnection("prepare PostgreSQL pipeline parameters: " + std::string(error.what()));
         return false;
     }
 
     return true;
 }
 
-// 非阻塞连接下，PQsendQueryPrepared() 可能只把数据放进 libpq 自己的缓冲区。
-// PQflush()==1 表示还没完全写进 socket，此时让 EventLoop 等 EPOLLOUT；绝不能在这里循环等它写完。
 bool LoopDatabaseContext::FlushOutput()
 {
     if (connection_failed_)
@@ -360,12 +456,21 @@ bool LoopDatabaseContext::FlushOutput()
     }
 
     const int flush_result = PQflush(connection_);
+
+    NLOG_DEBUG("[db] FlushOutput PQflush={} inflight={} completed={} writing={} sync_pending={}",
+               flush_result,
+               in_flight_requests_.size(),
+               completed_requests_.size(),
+               channel_->IsWriting(),
+               sync_pending_);
+
     if (flush_result < 0)
     {
         FailConnection("flush PostgreSQL output: " + ConnectionError());
         return false;
     }
 
+    // PQflush 返回 1 表示还有数据没发完，需要等 socket 可写再来一次；返回 0 表示已经发完。
     if (flush_result == 1)
     {
         if (!channel_->IsWriting())
@@ -384,6 +489,8 @@ bool LoopDatabaseContext::FlushOutput()
 
 void LoopDatabaseContext::OnReadable()
 {
+    // 可读事件的处理顺序固定：先把 socket 数据读进 libpq 缓冲区，
+    // 再把还没发出去的数据刷出去，最后解析已经完整的结果。三步不能调换。
     loop_->AssertInLoopThread();
 
     if (connection_failed_)
@@ -391,15 +498,21 @@ void LoopDatabaseContext::OnReadable()
         return;
     }
 
-    // socket 已经被 epoll 判断为可读，所以 PQconsumeInput() 这里只读取当前已经到达的数据，不等待网络。
-    if (PQconsumeInput(connection_) != 1)
+    const int consume_result = PQconsumeInput(connection_);
+
+    NLOG_DEBUG("[db] OnReadable PQconsumeInput={} PQisBusy={} inflight={} completed={} tid={}",
+               consume_result,
+               consume_result == 1 ? PQisBusy(connection_) : -1,
+               in_flight_requests_.size(),
+               completed_requests_.size(),
+               ThreadId());
+
+    if (consume_result != 1)
     {
         FailConnection("consume PostgreSQL input: " + ConnectionError());
         return;
     }
 
-    // PostgreSQL 可能在我们还有输出没写完时先发回 NOTICE 等数据。
-    // 先把可读数据清掉，再继续尝试 flush，避免两边互相等。
     if (!FlushOutput())
     {
         return;
@@ -432,40 +545,186 @@ void LoopDatabaseContext::OnSocketError()
     FailConnection("PostgreSQL socket error: " + ConnectionError());
 }
 
-// PQconsumeInput() 已经把当前可读数据搬进 libpq 缓冲区。
-// 只有 PQisBusy()==0 时，PQgetResult() 才保证不会等待新的网络数据。
 void LoopDatabaseContext::ProcessResults()
 {
-    if (!active_request_.has_value())
-    {
-        return;
-    }
+    // 一次可读事件里，PostgreSQL 可能已经把同一批多条 SQL 的结果一起发过来了，
+    // 所以这里要一直取到没有结果为止，而不是取到一条就返回。
+    // 还要注意：Pipeline 模式下取走最后一条结果后，PQgetResult() 会返回 nullptr，
+    // 而 PQisBusy() 仍然是 0。只看其中任何一个都会卡住，所以用"连续两次取不到结果"
+    // 来判定本批读完；中间只要拿到一条 PGresult 就重新计数。
+    std::size_t consecutive_empty_results = 0;
 
     while (PQisBusy(connection_) == 0)
     {
         PgResult result(PQgetResult(connection_), &PQclear);
-
         if (result == nullptr)
         {
-            // PQgetResult() 返回 nullptr 才表示这条命令已经完整结束，可以安全发送下一条 SQL。
-            DbResult completed = active_result_.has_value()
-                ? std::move(*active_result_)
-                : DbResult{false, 0, "PostgreSQL command completed without a result"};
-            CompleteActive(std::move(completed));
-            return;
-        }
-
-        if (active_result_.has_value())
-        {
-            // 当前每次只发送一条预处理 SQL，理论上只应得到一个非空 PGresult。
-            active_result_ = DbResult{false, 0, "PostgreSQL returned multiple results for one prepared statement"};
+            // 第一个 nullptr 表示当前 SQL 的结果已经结束，继续尝试取后面 SQL 的结果。
+            ++consecutive_empty_results;
+            if (consecutive_empty_results >= 2)
+            {
+                // 连续两次都没有新结果，说明这一批已经读完，回到 EventLoop 让排队任务得以执行。
+                break;
+            }
             continue;
         }
 
-        active_result_ = ParseResult(result.get(), active_request_->request.operation);
+        consecutive_empty_results = 0;
 
-        // 即使当前 PGresult 表示失败，也继续把 PQgetResult() 读到 nullptr。
-        // libpq 要求把当前命令的结果完整取完后，连接才能安全接收下一条命令。
+        const ExecStatusType status = PQresultStatus(result.get());
+
+        NLOG_DEBUG("[db] ProcessResults status={} is_pipeline_sync={} PQisBusy={} inflight={} "
+                   "completed={}",
+                   PQresStatus(status),
+                   status == PGRES_PIPELINE_SYNC,
+                   PQisBusy(connection_),
+                   in_flight_requests_.size(),
+                   completed_requests_.size());
+        // PGRES_PIPELINE_SYNC 是 PostgreSQL 返回的同步边界，表示上一条 Sync 之前的
+        // 那批 SQL 已经全部处理完，可以统一把结果交给协程了。
+        if (status == PGRES_PIPELINE_SYNC)
+        {
+            CompletePipeline();
+            if (connection_failed_)
+            {
+                return;
+            }
+            continue;
+        }
+
+        // 普通结果按发送顺序对应队首请求；一次可读事件里可以取走多条。
+        if (in_flight_requests_.empty())
+        {
+            FailConnection("PostgreSQL returned a result without a matching request");
+            return;
+        }
+
+        InFlightRequest request = std::move(in_flight_requests_.front());
+        in_flight_requests_.pop_front();
+
+        CompletedRequest completed;
+        completed.continuation = request.continuation;
+        completed.result = request.result;
+        completed.sent_at = request.sent_at;
+        completed.value.queue_wait_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                request.sent_at - request.submitted_at).count());
+
+        // PGRES_PIPELINE_ABORTED：这条 SQL 因为同批次里前面的 SQL 失败被跳过，实际没有执行。
+        if (status == PGRES_PIPELINE_ABORTED)
+        {
+            completed.value.success = false;
+            completed.value.value = 0;
+            completed.value.error =
+                "request was not executed because an earlier SQL statement failed in this pipeline";
+            sync_failed_ = true;
+            if (sync_failure_message_.empty())
+            {
+                sync_failure_message_ = completed.value.error;
+            }
+            completed_requests_.push_back(std::move(completed));
+            continue;
+        }
+
+        DbResult parsed = ParseResult(result.get(), request.request.operation);
+        parsed.queue_wait_us = completed.value.queue_wait_us;
+        completed.value = std::move(parsed);
+
+        // PGRES_FATAL_ERROR：这条 SQL 自身执行失败；整批结果要等同步点再统一判定是否回滚。
+        if (status == PGRES_FATAL_ERROR)
+        {
+            sync_failed_ = true;
+            if (sync_failure_message_.empty())
+            {
+                sync_failure_message_ = completed.value.error;
+            }
+        }
+        // PGRES_BAD_RESPONSE：PostgreSQL 返回了无法按协议解析的响应，这条连接不能再继续使用。
+        else if (status == PGRES_BAD_RESPONSE)
+        {
+            FailConnection("PostgreSQL returned a bad pipeline response: " + completed.value.error);
+            return;
+        }
+
+        completed_requests_.push_back(std::move(completed));
+    }
+}
+
+void LoopDatabaseContext::CompletePipeline()
+{
+    // 一个同步点之间的 SQL 属于同一个隐式事务。只有确认收到同步点，才能保证这批写操作
+    // 没有被同批的其他失败拖累回滚，所以结果统一在这里交付，而不是结果一回来就交给协程。
+    NLOG_DEBUG("[db] CompletePipeline enter completed={} sync_failed={} inflight={} tid={}",
+               completed_requests_.size(),
+               sync_failed_,
+               in_flight_requests_.size(),
+               ThreadId());
+
+    if (completed_requests_.empty())
+    {
+        // 没有待确认的请求却收到同步点，说明连接状态和本地记录已经对不上。
+        FailConnection("PostgreSQL pipeline sync arrived without any pending result");
+        return;
+    }
+
+    const TimePoint completed_at = Clock::now();
+    std::vector<std::coroutine_handle<>> continuations;
+    continuations.reserve(completed_requests_.size());
+
+    for (CompletedRequest& request : completed_requests_)
+    {
+        // 一个同步点之间属于同一个隐式事务。只要其中一条 SQL 出错，之前成功执行的写操作也会回滚。
+        // 因此不能提前把这一批里的成功结果交给 RPC 协程，必须等同步点确认后再统一完成。
+        if (sync_failed_ && request.value.success)
+        {
+            request.value.success = false;
+            request.value.value = 0;
+            request.value.error = "pipeline batch was rolled back because another SQL statement failed: " +
+                                  sync_failure_message_;
+        }
+
+        request.value.database_call_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                completed_at - request.sent_at).count());
+        *request.result = std::move(request.value);
+        continuations.push_back(request.continuation);
+    }
+
+    completed_requests_.clear();
+    sync_failed_ = false;
+    sync_failure_message_.clear();
+
+    NLOG_DEBUG("[db] CompletePipeline resume {} continuations tid={}",
+               continuations.size(),
+               ThreadId());
+
+    for (const std::coroutine_handle<> continuation : continuations)
+    {
+        ResumeLater(continuation);
+    }
+}
+
+std::string LoopDatabaseContext::ValidateRequest(const DbRequest& request) const
+{
+    if (request.key == 0 || request.key > kPostgresBigintMax)
+    {
+        return "database key must be between 1 and PostgreSQL BIGINT max";
+    }
+
+    if (request.operation == DbOperation::Insert && request.value > kPostgresBigintMax)
+    {
+        return "database value exceeds PostgreSQL BIGINT max";
+    }
+
+    switch (request.operation)
+    {
+        case DbOperation::Read:
+        case DbOperation::Insert:
+        case DbOperation::Update:
+        case DbOperation::Delete:
+            return {};
+        default:
+            return "unsupported database operation";
     }
 }
 
@@ -524,35 +783,6 @@ DbResult LoopDatabaseContext::ParseResult(PGresult* result, DbOperation operatio
     return {true, affected_rows, {}};
 }
 
-void LoopDatabaseContext::CompleteActive(DbResult result)
-{
-    if (!active_request_.has_value())
-    {
-        return;
-    }
-
-    result.queue_wait_us = active_request_->result->queue_wait_us;
-    result.database_call_us = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            Clock::now() - active_started_at_).count());
-
-    DbResult* result_storage = active_request_->result;
-    const std::coroutine_handle<> continuation = active_request_->continuation;
-
-    *result_storage = std::move(result);
-    active_request_.reset();
-    active_result_.reset();
-
-    // 当前就在原 EventLoop 线程里，不再需要跨线程唤醒。
-    // 仍然 QueueInLoop 而不是直接 resume，避免在 Channel 回调栈里继续执行整段 RPC 业务代码。
-    ResumeLater(continuation);
-
-    if (!connection_failed_)
-    {
-        StartNextRequest();
-    }
-}
-
 void LoopDatabaseContext::FailConnection(std::string error)
 {
     if (connection_failed_)
@@ -568,44 +798,76 @@ void LoopDatabaseContext::FailConnection(std::string error)
         channel_->DisableAll();
     }
 
-    if (active_request_.has_value())
-    {
-        DbResult failed{false, 0, connection_failure_};
-        failed.queue_wait_us = active_request_->result->queue_wait_us;
-        failed.database_call_us = static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                Clock::now() - active_started_at_).count());
-
-        *active_request_->result = std::move(failed);
-        const std::coroutine_handle<> continuation = active_request_->continuation;
-        active_request_.reset();
-        active_result_.reset();
-        ResumeLater(continuation);
-    }
-
     const TimePoint failed_at = Clock::now();
-    while (!pending_requests_.empty())
-    {
-        PendingRequest pending = std::move(pending_requests_.front());
-        pending_requests_.pop_front();
+    std::vector<std::coroutine_handle<>> continuations;
+    continuations.reserve(in_flight_requests_.size() + completed_requests_.size());
 
-        pending.result->success = false;
-        pending.result->error = connection_failure_;
-        pending.result->queue_wait_us = static_cast<std::uint64_t>(
+    // 已经发出去但没等到同步点的请求：SQL 可能已经执行，也可能被回滚，只能报"结果未知"。
+    for (InFlightRequest& request : in_flight_requests_)
+    {
+        DbResult result{false, 0,
+                        "PostgreSQL connection failed before the pipeline sync point; transaction outcome is unknown: " +
+                            connection_failure_};
+        result.queue_wait_us = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
-                failed_at - pending.submitted_at).count());
-        ResumeLater(pending.continuation);
+                request.sent_at - request.submitted_at).count());
+        result.database_call_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                failed_at - request.sent_at).count());
+        *request.result = std::move(result);
+        continuations.push_back(request.continuation);
+    }
+    in_flight_requests_.clear();
+
+    // 已经拿到结果但同步点没到：同样不能当作成功。
+    for (CompletedRequest& request : completed_requests_)
+    {
+        DbResult result{false, 0,
+                        "PostgreSQL connection failed before the pipeline sync point; transaction outcome is unknown: " +
+                            connection_failure_};
+        result.queue_wait_us = request.value.queue_wait_us;
+        result.database_call_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                failed_at - request.sent_at).count());
+        *request.result = std::move(result);
+        continuations.push_back(request.continuation);
+    }
+    completed_requests_.clear();
+
+    sync_pending_ = false;
+    sync_scheduled_ = false;
+    sync_failed_ = false;
+    sync_failure_message_.clear();
+
+    for (const std::coroutine_handle<> continuation : continuations)
+    {
+        ResumeLater(continuation);
     }
 }
 
 void LoopDatabaseContext::ResumeLater(std::coroutine_handle<> continuation)
 {
+    if (!continuation)
+    {
+        return;
+    }
+
+    // 不能在这里直接 resume：此刻还在 PostgreSQL socket 的事件回调里，
+    // 协程恢复后可能立刻提交新请求，进而改动正在被遍历的队列。
+    // 交给 EventLoop 在当前这一轮处理结束后统一恢复，避开回调内重入。
+    NLOG_DEBUG("[db] ResumeLater queued cont=0x{:x} tid={}",
+               ContinuationAddress(continuation),
+               ThreadId());
+
     loop_->QueueInLoop([continuation]
         {
-            if (continuation)
-            {
-                continuation.resume();
-            }
+            NLOG_DEBUG("[db] ResumeLater resume begin cont=0x{:x} tid={}",
+                       ContinuationAddress(continuation),
+                       ThreadId());
+            continuation.resume();
+            NLOG_DEBUG("[db] ResumeLater resume end cont=0x{:x} tid={}",
+                       ContinuationAddress(continuation),
+                       ThreadId());
         });
 }
 
@@ -642,12 +904,7 @@ std::string LoopDatabaseContext::ConnectionError() const
         return "unknown PostgreSQL connection error";
     }
 
-    std::string error(message);
-    while (!error.empty() && (error.back() == '\n' || error.back() == '\r'))
-    {
-        error.pop_back();
-    }
-    return error;
+    return TrimTrailingNewlines(message);
 }
 
 DbOperationAwaiter::DbOperationAwaiter(LoopDatabaseContext& database, DbRequest request)

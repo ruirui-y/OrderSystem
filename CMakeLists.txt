@@ -21,7 +21,7 @@ option(ORDERSYSTEM_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
 find_package(Protobuf REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBPQ REQUIRED IMPORTED_TARGET libpq)
+pkg_check_modules(LIBPQ REQUIRED IMPORTED_TARGET libpq>=14)
 
 set(NEBULARPC_ROOT "$ENV{HOME}/.vs/NebulaRPC" CACHE PATH "Path to the existing NebulaRPC source repository")
 if(NOT EXISTS "${NEBULARPC_ROOT}/CMakeLists.txt")
@@ -47,7 +47,7 @@ add_library(order_db_benchmark_proto STATIC
 target_include_directories(order_db_benchmark_proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(order_db_benchmark_proto PUBLIC protobuf::libprotobuf)
 
-# 阶段 2：每个 IO EventLoop 自己驱动一条非阻塞 PostgreSQL 连接，不再创建 DB Worker 线程池。
+# 阶段 3：每个 IO EventLoop 使用一条非阻塞 PostgreSQL 连接，并通过 Pipeline 批量发送请求。
 add_executable(order_db_benchmark_server
     benchmarks/order_db/order_db_benchmark_server.cpp
     src/database/loop_database_context.cpp
